@@ -1,0 +1,5 @@
+menuconfig DRIVERS_PGA460
+	bool "PGA460"
+	default n
+	---help---
+		Enable support for the TI PGA460 ultrasonic sensor.
