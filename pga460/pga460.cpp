@@ -4,6 +4,8 @@
 #include <px4_platform_common/getopt.h>
 #include <px4_platform_common/log.h>
 
+#include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
+
 #include <uORB/topics/pga_data.h>
 
 #include <stdlib.h>
@@ -13,44 +15,118 @@
 #include <poll.h>
 #include <errno.h>
 
+using namespace time_literals;
+
 extern "C" __EXPORT int pga460_main(int argc, char *argv[]);
 
-class PGA460 {
+class PGA460 : public ModuleBase, public px4::ScheduledWorkItem {
 public:
-	PGA460() = default;
-	~PGA460() { stop(); }
+	PGA460(const char *device);
+    	~PGA460() override = default;
 
-	int start(const char *device);
-
-	void stop();
-
-	static int task_main_helper(int argc, char *argv[]);
+	static int task_spawn(int argc, char *argv[]);
+	static int custom_command(int argc, char *argv[]);
+	static int print_usage(const char *reason = nullptr);
+	int print_status() override;
 
 private:
-	bool _task_should_exit{false};
+	bool _initialized{false};
+	bool _waiting_for_echo{false};
 	int _uart_fd{-1};
 	char _device[20]{};
-
+	uint8_t _current_errors{0};
 	orb_advert_t _topic_handle = nullptr;
 
+	void Run() override;
+
+	void request_stop() override;
+
 	int open_uart(const char *device);
+	void close_uart();
 
 	ssize_t write_data(const uint8_t *buffer, size_t len);
-
 	ssize_t read_data(uint8_t *buffer, size_t len, int timeout_ms);
-
-	void task_main();
 
 	uint8_t calculate_checksum(uint8_t *data, size_t len);
 
 	void send_burst_and_listen();
-
-	int16_t request_distance();
-
-	void uorb_publisher(int16_t distance_raw);
+	float request_distance();
+	void uorb_publisher(float distance_raw);
 };
 
-static PGA460 *g_driver = nullptr;
+PGA460::PGA460(const char *device) :
+    ModuleBase(),
+    ScheduledWorkItem("PGA460", px4::wq_configurations::lp_default)
+{
+    strncpy(_device, device, sizeof(_device) - 1);
+    _device[sizeof(_device) - 1] = '\0';
+
+    if (open_uart(_device) >= 0) {
+        _initialized = true;
+    }
+}
+
+int PGA460::task_spawn(int argc, char *argv[])
+{
+	const char *device = "/dev/ttyS1";
+
+	PGA460 *instance = new PGA460(device);
+
+	if (!instance) {
+		return PX4_ERROR;
+	}
+
+	if (!instance->_initialized) {
+        	delete instance;
+        	return PX4_ERROR;
+    	}
+
+	pga460_descriptor.object.store(instance);
+	pga460_descriptor.task_id = task_id_is_work_queue;
+
+	instance->ScheduleNow();
+
+	return PX4_OK;
+}
+
+void PGA460::request_stop()
+{
+    ModuleBase::request_stop();
+
+    close_uart();
+
+    if (_topic_handle != nullptr) {
+        orb_unadvertise(_topic_handle);
+        _topic_handle = nullptr;
+    }
+}
+
+int PGA460::print_status()
+{
+    PX4_INFO("Running");
+    PX4_INFO("UART: %s", _device);
+    PX4_INFO("Errors: %u", _current_errors);
+    return 0;
+}
+
+int PGA460::custom_command(int argc, char *argv[])
+{
+    	return print_usage("unknown command");
+}
+
+int PGA460::print_usage(const char *reason)
+{
+	if (reason) {
+		PX4_WARN("%s\n", reason);
+	}
+
+	PRINT_MODULE_USAGE_NAME("pga460", "driver");
+	PRINT_MODULE_USAGE_COMMAND("start");
+	PRINT_MODULE_USAGE_COMMAND("stop");
+	PRINT_MODULE_USAGE_COMMAND("status");
+
+	return 0;
+}
 
 int PGA460::open_uart(const char *device) {
 	_uart_fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -69,7 +145,7 @@ int PGA460::open_uart(const char *device) {
 	uart_config.c_cflag |= CS8;
 	uart_config.c_cflag &= ~PARENB;
 	uart_config.c_cflag &= ~CSTOPB;
-	uart_config.c_cflag &= ~CRTSCTS;    // Без аппаратного управления потоком
+	uart_config.c_cflag &= ~CRTSCTS;
 
 	// Сырой ввод/вывод (Raw mode)
 	uart_config.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
@@ -83,65 +159,59 @@ int PGA460::open_uart(const char *device) {
 	return _uart_fd;
 }
 
+void PGA460::close_uart() {
+	if (_uart_fd >= 0) {
+		close(_uart_fd);
+		_uart_fd = -1;
+	}
+}
+
 ssize_t PGA460::write_data(const uint8_t *buffer, size_t len) {
 	if (_uart_fd < 0) return -1;
 	return write(_uart_fd, buffer, len);
 }
 
 ssize_t PGA460::read_data(uint8_t *buffer, size_t len, int timeout_ms) {
-	struct pollfd fds[1];
-	fds[0].fd = _uart_fd;
-	fds[0].events = POLLIN;
+	if (_uart_fd < 0) return -1;
+	size_t remaining = len;
+	int64_t starting_time = hrt_absolute_time();
+	while (remaining > 0) {
 
-	// Ждем данные
-	int ret = poll(fds, 1, timeout_ms);
+		int64_t elapsed_ms = (hrt_absolute_time() - starting_time) / 1000;
 
-	if (ret > 0 && (fds[0].revents & POLLIN)) {
-		return read(_uart_fd, buffer, len);
+		if (elapsed_ms >= timeout_ms) {
+			return -1;
+		}
+
+		struct pollfd fds[1];
+		fds[0].fd = _uart_fd;
+		fds[0].events = POLLIN;
+
+		int ret = poll(fds, 1, timeout_ms - elapsed_ms);
+		if (ret <= 0) return -1;
+
+		ssize_t n = read(_uart_fd, buffer + (len - remaining), remaining);
+		if (n <= 0) return n;
+
+		remaining -= n;
 	}
-	return ret; // 0 - timeout, <0 - error
+	return len;
 }
 
-void PGA460::task_main() {
-	if (open_uart(_device) < 0) return;
-
-	PX4_INFO("Driver started on %s", _device);
-
-	while (!_task_should_exit) {
+void PGA460::Run() {
+	if (should_exit()) {
+		exit_and_cleanup(pga460_descriptor);
+		return;
+	}
+	if (!_waiting_for_echo) {
 		send_burst_and_listen();
-
-		// Ждем, пока звук долетит до препятствия и вернется.
-		// Для 3-5 метров достаточно 40-60 мс.
-		px4_usleep(60000);
-
-		// Запрашиваем результат
+		_waiting_for_echo = true;
+		ScheduleDelayed(100_ms);
+	} else {
 		uorb_publisher(request_distance());
+		_waiting_for_echo = false;
+		ScheduleDelayed(100_ms);
 	}
-
-	close(_uart_fd);
-	_uart_fd = -1;
-}
-
-int PGA460::task_main_helper(int argc, char *argv[]) {
-	g_driver->task_main();
-	return 0;
-}
-
-int PGA460::start(const char *device) {
-	strncpy(_device, device, sizeof(_device));
-	_task_should_exit = false;
-
-	int task_id = px4_task_spawn_cmd("pga460_driver",
-					SCHED_DEFAULT,
-					SCHED_PRIORITY_DEFAULT,
-					1500,
-					&PGA460::task_main_helper,
-					nullptr);
-	return (task_id > 0) ? 0 : -1;
-}
-
-void PGA460::stop() {
-    	_task_should_exit = true;
 }
 
 uint8_t PGA460::calculate_checksum(uint8_t *data, size_t len) {
@@ -154,82 +224,86 @@ uint8_t PGA460::calculate_checksum(uint8_t *data, size_t len) {
 
 void PGA460::send_burst_and_listen() {
 	uint8_t body[2];
-	body[0] = 0x00; // Команда Burst and Listen
-	body[1] = 0x01; // Искать 1 объект
+	body[0] = 0x00;
+	body[1] = 0x01;
 
 	uint8_t checksum = calculate_checksum(body, 2);
 
 	uint8_t packet[4] = {0x55, body[0], body[1], checksum};
 
-	write_data(packet, sizeof(packet));
+	if (write_data(packet, sizeof(packet)) != sizeof(packet)) {
+		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
+	}
 }
 
-int16_t PGA460::request_distance() {
-    	uint8_t body[1] = {0x05}; // Команда запроса результатов
+float PGA460::request_distance() {
+    	uint8_t body[1] = {0x05};
     	uint8_t checksum = calculate_checksum(body, 1);
 
     	uint8_t packet[3] = {0x55, body[0], checksum};
 
-    	write_data(packet, sizeof(packet));
+    	if (write_data(packet, sizeof(packet)) != sizeof(packet)) {
+		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
+	}
 
-    	uint8_t response[6];
-    	int n = read_data(response, sizeof(response), 50);
+	uint8_t response[6];
+	int n = read_data(response, sizeof(response), 50);
 
-    	if (n > 0) {
-		return (response[1] << 8) | response[2];
-    	}
-    	return -1;
+	if (n != 6) {
+		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
+		tcflush(_uart_fd, TCIFLUSH);
+		return -1.0f;
+	}
+
+	uint8_t calc_cs = calculate_checksum(response, 5);
+	if (calc_cs != response[5]) {
+		_current_errors |= pga_data_s::ERR_UART_INVALID_SLAVE_CHECKSUM;
+		return -1.0f;
+	}
+
+	uint8_t diag_data = response[0];
+
+	if (diag_data & 0x3E) {
+		if (diag_data & (1 << 1)) _current_errors |= pga_data_s::ERR_UART_BAUD_RATE_MISMATCH;
+		if (diag_data & (1 << 2)) _current_errors |= pga_data_s::ERR_UART_SYNC_STABILITY;
+		if (diag_data & (1 << 3)) {
+			_current_errors |= pga_data_s::ERR_UART_INVALID_MASTER_CHECKSUM;
+			tcflush(_uart_fd, TCOFLUSH);
+		}
+		if (diag_data & (1 << 4)) _current_errors |= pga_data_s::ERR_UART_UNKNOWN_COMMAND;
+		if (diag_data & (1 << 5)) _current_errors |= pga_data_s::ERR_UART_FRAMING_FAILURE;
+		return -1.0f;
+	}
+
+	uint16_t tof = (response[1] << 8) | response[2];
+	return (331.0f * tof * 0.00000001f) / 2.0f;
 }
 
-void PGA460::uorb_publisher(int16_t distance_raw) {
+void PGA460::uorb_publisher(float distance_raw) {
 	struct pga_data_s my_data{};
 
 	my_data.timestamp = hrt_absolute_time();
-	my_data.distance_m = (float)distance_raw / 1000.0f;
+	my_data.distance_m = distance_raw;
+	my_data.max_distance = 11.0f;
+
+	my_data.status_flags = _current_errors;
 
 	if (_topic_handle == nullptr) {
 		_topic_handle = orb_advertise(ORB_ID(pga_data), &my_data);
 	} else {
 		orb_publish(ORB_ID(pga_data), _topic_handle, &my_data);
 	}
+
+	_current_errors = 0;
 }
+
+static ModuleBase::Descriptor pga460_descriptor(
+	&PGA460::task_spawn,
+	&PGA460::custom_command,
+	&PGA460::print_usage
+);
 
 int pga460_main(int argc, char *argv[]) {
-    	if (argc < 2) {
-        	PX4_INFO("Usage: pga460 {start|stop|status} [-d /dev/ttySXX]");
-        	return 1;
-    	}
-
-    	const char *device = "/dev/ttyS6"; // Значение по умолчанию
-    	int ch;
-    	int myoptind = 1;
-    	const char *myoptarg = nullptr;
-    	while ((ch = px4_getopt(argc, argv, "d:", &myoptind, &myoptarg)) != EOF) {
-        	if (ch == 'd') device = myoptarg;
-    	}
-
-	if (!strcmp(argv[1], "start")) {
-		if (g_driver) {
-			PX4_WARN("Already running");
-			return 0;
-		}
-		g_driver = new PGA460();
-		if (g_driver->start(device) != 0) {
-			delete g_driver;
-			g_driver = nullptr;
-			return 1;
-		}
-		return 0;
-	}
-
-	if (!strcmp(argv[1], "stop")) {
-		if (g_driver) {
-			delete g_driver;
-			g_driver = nullptr;
-			PX4_INFO("Stopped");
-		}
-		return 0;
-	}
-
-	return 0;
+    return ModuleBase::main(pga460_descriptor, argc, argv);
 }
+
