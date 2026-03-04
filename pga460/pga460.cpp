@@ -1,58 +1,8 @@
-#include <px4_platform_common/px4_config.h>
-#include <px4_platform_common/tasks.h>
-#include <px4_platform_common/module.h>
-#include <px4_platform_common/getopt.h>
-#include <px4_platform_common/log.h>
-
-#include <px4_platform_common/px4_work_queue/ScheduledWorkItem.hpp>
-
-#include <uORB/topics/pga_data.h>
-
-#include <stdlib.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <termios.h>
-#include <poll.h>
-#include <errno.h>
+#include "pga460.h"
 
 using namespace time_literals;
 
 extern "C" __EXPORT int pga460_main(int argc, char *argv[]);
-
-class PGA460 : public ModuleBase, public px4::ScheduledWorkItem {
-public:
-	PGA460(const char *device);
-    	~PGA460() override = default;
-
-	static int task_spawn(int argc, char *argv[]);
-	static int custom_command(int argc, char *argv[]);
-	static int print_usage(const char *reason = nullptr);
-	int print_status() override;
-
-private:
-	bool _initialized{false};
-	bool _waiting_for_echo{false};
-	int _uart_fd{-1};
-	char _device[20]{};
-	uint8_t _current_errors{0};
-	orb_advert_t _topic_handle = nullptr;
-
-	void Run() override;
-
-	void request_stop() override;
-
-	int open_uart(const char *device);
-	void close_uart();
-
-	ssize_t write_data(const uint8_t *buffer, size_t len);
-	ssize_t read_data(uint8_t *buffer, size_t len, int timeout_ms);
-
-	uint8_t calculate_checksum(uint8_t *data, size_t len);
-
-	void send_burst_and_listen();
-	float request_distance();
-	void uorb_publisher(float distance_raw);
-};
 
 PGA460::PGA460(const char *device) :
     ModuleBase(),
@@ -171,31 +121,30 @@ ssize_t PGA460::write_data(const uint8_t *buffer, size_t len) {
 	return write(_uart_fd, buffer, len);
 }
 
-ssize_t PGA460::read_data(uint8_t *buffer, size_t len, int timeout_ms) {
-	if (_uart_fd < 0) return -1;
-	size_t remaining = len;
-	int64_t starting_time = hrt_absolute_time();
-	while (remaining > 0) {
+void PGA460::read_data(size_t bytes_needed) {
+    uint8_t temp_buf[10];
+    int n = read(_uart_fd, temp_buf, sizeof(temp_buf));
 
-		int64_t elapsed_ms = (hrt_absolute_time() - starting_time) / 1000;
-
-		if (elapsed_ms >= timeout_ms) {
-			return -1;
-		}
-
-		struct pollfd fds[1];
-		fds[0].fd = _uart_fd;
-		fds[0].events = POLLIN;
-
-		int ret = poll(fds, 1, timeout_ms - elapsed_ms);
-		if (ret <= 0) return -1;
-
-		ssize_t n = read(_uart_fd, buffer + (len - remaining), remaining);
-		if (n <= 0) return n;
-
-		remaining -= n;
-	}
-	return len;
+    if (n > 0) {
+        for (int i = 0; i < n && _bytes_received < sizeof(_read_buffer); i++) {
+            _read_buffer[_bytes_received++] = temp_buf[i];
+        }
+    }
+    if (_bytes_received >= bytes_needed) {
+        float distance = distance_processing(_read_buffer);
+        uorb_publisher(distance);
+        _state = State::SEND_BURST;
+        ScheduleDelayed(50_ms);
+    } else {
+        if (hrt_elapsed_time(&_last_state_change) > 100_ms) {
+            _current_errors |= pga_data_s::ERR_COMM_FAILURE;
+	    uorb_publisher(-1.0f);
+            _state = State::SEND_BURST;
+            ScheduleDelayed(10_ms);
+            return;
+        }
+        ScheduleDelayed(1_ms);
+    }
 }
 
 void PGA460::Run() {
@@ -203,15 +152,26 @@ void PGA460::Run() {
 		exit_and_cleanup(pga460_descriptor);
 		return;
 	}
-	if (!_waiting_for_echo) {
-		send_burst_and_listen();
-		_waiting_for_echo = true;
-		ScheduleDelayed(100_ms);
-	} else {
-		uorb_publisher(request_distance());
-		_waiting_for_echo = false;
-		ScheduleDelayed(100_ms);
-	}
+	switch (_state) {
+		case State::SEND_BURST:
+			send_burst_and_listen();
+			_state = State::WAIT_FOR_ECHO;
+			_last_state_change = hrt_absolute_time();
+			ScheduleDelayed(30_ms);
+			break;
+
+		case State::WAIT_FOR_ECHO:
+			request_distance();
+			_bytes_received = 0;
+			_state = State::READ_DATA;
+			_last_state_change = hrt_absolute_time();
+			ScheduleDelayed(2_ms);
+			break;
+
+		case State::READ_DATA:
+			read_data(6);
+
+		}
 }
 
 uint8_t PGA460::calculate_checksum(uint8_t *data, size_t len) {
@@ -236,7 +196,7 @@ void PGA460::send_burst_and_listen() {
 	}
 }
 
-float PGA460::request_distance() {
+void PGA460::request_distance() {
     	uint8_t body[1] = {0x05};
     	uint8_t checksum = calculate_checksum(body, 1);
 
@@ -245,11 +205,10 @@ float PGA460::request_distance() {
     	if (write_data(packet, sizeof(packet)) != sizeof(packet)) {
 		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
 	}
+}
 
-	uint8_t response[6];
-	int n = read_data(response, sizeof(response), 50);
-
-	if (n != 6) {
+float PGA460::distance_processing(uint8_t *response) {
+	if (sizeof(response) != 6) {
 		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
 		tcflush(_uart_fd, TCIFLUSH);
 		return -1.0f;
@@ -296,12 +255,6 @@ void PGA460::uorb_publisher(float distance_raw) {
 
 	_current_errors = 0;
 }
-
-static ModuleBase::Descriptor pga460_descriptor(
-	&PGA460::task_spawn,
-	&PGA460::custom_command,
-	&PGA460::print_usage
-);
 
 int pga460_main(int argc, char *argv[]) {
     return ModuleBase::main(pga460_descriptor, argc, argv);
