@@ -20,6 +20,14 @@ int PGA460::task_spawn(int argc, char *argv[])
 {
 	const char *device = "/dev/ttyS1";
 
+	int ch;
+	int myoptind = 1;
+	const char *myoptarg = nullptr;
+
+	while ((ch = px4_getopt(argc, argv, "d:", &myoptind, &myoptarg)) != EOF) {
+		if (ch == 'd') device = myoptarg;
+	}
+
 	PGA460 *instance = new PGA460(device);
 
 	if (!instance) {
@@ -72,6 +80,7 @@ int PGA460::print_usage(const char *reason)
 
 	PRINT_MODULE_USAGE_NAME("pga460", "driver");
 	PRINT_MODULE_USAGE_COMMAND("start");
+	PRINT_MODULE_USAGE_PARAM_STRING('d', "/dev/ttyS1", "<file>", "UART device", false);
 	PRINT_MODULE_USAGE_COMMAND("stop");
 	PRINT_MODULE_USAGE_COMMAND("status");
 
@@ -131,17 +140,14 @@ void PGA460::read_data(size_t bytes_needed) {
         }
     }
     if (_bytes_received >= bytes_needed) {
-        float distance = distance_processing(_read_buffer);
-        uorb_publisher(distance);
-        _state = State::SEND_BURST;
-        ScheduleDelayed(50_ms);
+        _state = State::PUBLISH_DATA;
+	ScheduleDelayed(10_ms);
     } else {
         if (hrt_elapsed_time(&_last_state_change) > 100_ms) {
             _current_errors |= pga_data_s::ERR_COMM_FAILURE;
-	    uorb_publisher(-1.0f);
-            _state = State::SEND_BURST;
-            ScheduleDelayed(10_ms);
-            return;
+            _state = State::PUBLISH_DATA;
+	    ScheduleDelayed(10_ms);
+	    return;
         }
         ScheduleDelayed(1_ms);
     }
@@ -170,8 +176,16 @@ void PGA460::Run() {
 
 		case State::READ_DATA:
 			read_data(6);
+			break;
 
-		}
+		case State::PUBLISH_DATA:
+			float distance = distance_processing(_read_buffer, _bytes_received);
+			uorb_publisher(distance);
+			_state = State::SEND_BURST;
+			_bytes_received = 0;
+			ScheduleDelayed(50_ms);
+
+	}
 }
 
 uint8_t PGA460::calculate_checksum(uint8_t *data, size_t len) {
@@ -207,8 +221,8 @@ void PGA460::request_distance() {
 	}
 }
 
-float PGA460::distance_processing(uint8_t *response) {
-	if (sizeof(response) != 6) {
+float PGA460::distance_processing(uint8_t *response, size_t len) {
+	if (len != 6) {
 		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
 		tcflush(_uart_fd, TCIFLUSH);
 		return -1.0f;
