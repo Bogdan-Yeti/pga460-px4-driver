@@ -14,13 +14,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
-#include <poll.h>
 #include <errno.h>
 
 enum class State {
     SEND_BURST,
     WAIT_FOR_ECHO,
-    READ_DATA
+    READ_DATA,
+    PUBLISH_DATA
 };
 
 class PGA460 : public ModuleBase, public px4::ScheduledWorkItem {
@@ -32,6 +32,8 @@ public:
 	static int custom_command(int argc, char *argv[]);
 	static int print_usage(const char *reason = nullptr);
 	int print_status() override;
+
+	static ModuleBase::Descriptor pga460_descriptor;
 
 private:
 	bool _initialized{false};
@@ -54,19 +56,24 @@ private:
 	void close_uart();
 
 	ssize_t write_data(const uint8_t *buffer, size_t len);
-	void read_data(size_t bytes_needed);
+	ssize_t read_data(size_t bytes_needed);
 
 	uint8_t calculate_checksum(uint8_t *data, size_t len);
 
 	void send_burst_and_listen();
 	void request_distance();
-	float distance_processing(uint8_t *response);
+	float distance_processing(uint8_t *response, size_t len);
 	void uorb_publisher(float distance_raw);
+
+	bool write_register(uint8_t reg, uint8_t value);
+	bool init_hw();
 };
 
-static ModuleBase::Descriptor pga460_descriptor(
-	&PGA460::task_spawn,
-	&PGA460::custom_command,
-	&PGA460::print_usage
-);
+struct pga460_config_t {
+    uint8_t addr;
+    uint8_t value;
+};
+
+
+
 

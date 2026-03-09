@@ -4,6 +4,26 @@ using namespace time_literals;
 
 extern "C" __EXPORT int pga460_main(int argc, char *argv[]);
 
+static const pga460_config_t pga460_config[] = {
+    // --- Драйвер и Частота ---
+    {0x14, 0x32}, // FREQ: 40kHz (при 16MHz тактовой)
+    {0x15, 0x08}, // P1_PULSE_COUNT: 8 импульсов
+    {0x10, 0x40}, // CURR_LIM_P1: ограничение тока
+    {0x1B, 0x0F}, // DECPL_TIME: время декупажа (уменьшает слепую зону)
+
+    // --- Time Varied Gain (Усиление) ---
+    {0x1D, 0x11}, // TVG_RANGE: диапазон усиления
+    {0x1E, 0x88}, // TVG_GAIN_0
+    {0x1F, 0xAA}, // TVG_GAIN_1
+    {0x20, 0xCC}, // TVG_GAIN_2
+    {0x21, 0xFF}, // TVG_GAIN_3 (максимум на дистанции)
+
+    // --- Thresholds (Пороги для пресета P1) ---
+    {0x40, 0xEE}, {0x41, 0xEE}, {0x42, 0xDD}, // Высокие пороги в начале (0-50см)
+    {0x43, 0xBB}, {0x44, 0x88}, {0x45, 0x77}, // Снижение (50см - 2м)
+    {0x46, 0x66}, {0x47, 0x55}, {0x48, 0x44}  // Низкие пороги для дали (2м+)
+};
+
 PGA460::PGA460(const char *device) :
     ModuleBase(),
     ScheduledWorkItem("PGA460", px4::wq_configurations::lp_default)
@@ -29,15 +49,16 @@ int PGA460::task_spawn(int argc, char *argv[])
 	}
 
 	PGA460 *instance = new PGA460(device);
-
-	if (!instance) {
+	if (!instance || !instance->_initialized) {
+		delete instance;
 		return PX4_ERROR;
 	}
 
-	if (!instance->_initialized) {
-        	delete instance;
-        	return PX4_ERROR;
-    	}
+	if (!instance->init_hw()) {
+		PX4_ERR("Hardware init failed, aborting");
+		delete instance;
+		return PX4_ERROR;
+	}
 
 	pga460_descriptor.object.store(instance);
 	pga460_descriptor.task_id = task_id_is_work_queue;
@@ -96,7 +117,12 @@ int PGA460::open_uart(const char *device) {
 	}
 
 	struct termios uart_config;
-	tcgetattr(_uart_fd, &uart_config);
+	if (tcgetattr(_uart_fd, &uart_config) != 0) {
+		PX4_ERR("tcgetattr failed for %s: %d", device, errno);
+		close(_uart_fd);
+		uart_fd = -1;
+		return -1;
+	}
 
 	// Настройка: 8N1 (8 бит, без четности, 1 стоп-бит)
 	uart_config.c_cflag |= (CLOCAL | CREAD);
@@ -111,10 +137,15 @@ int PGA460::open_uart(const char *device) {
 	uart_config.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
 	uart_config.c_oflag &= ~OPOST;
 
-	cfsetispeed(&uart_config, B9600);
-	cfsetospeed(&uart_config, B9600);
+	cfsetispeed(&uart_config, B115200);
+	cfsetospeed(&uart_config, B115200);
 
-	tcsetattr(_uart_fd, TCSANOW, &uart_config);
+	if (tcsetattr(_uart_fd, TCSANOW, &uart_config) != 0) {
+		PX4_ERR("tcsetattr failed for %s: %d", device, errno);
+		close(_uart_fd);
+		uart_fd = -1;
+		return -1;
+	}
 	return _uart_fd;
 }
 
@@ -127,30 +158,71 @@ void PGA460::close_uart() {
 
 ssize_t PGA460::write_data(const uint8_t *buffer, size_t len) {
 	if (_uart_fd < 0) return -1;
-	return write(_uart_fd, buffer, len);
+	size_t total_written = 0;
+
+	while (total_written < len) {
+	    	ssize_t n = write(_uart_fd, buffer + total_written, len - total_written);
+	    	if (n > 0) {
+			total_written += n;
+	    	} else if (n < 0) {
+			if (errno == EINTR) {
+		    	continue; // ← прерваны сигналом — просто повторить
+		} else if (errno == EAGAIN) {
+		    	// Буфер ядра заполнен — подождать и повторить
+		    	usleep(100);
+		    	continue;
+		} else {
+		    	// Настоящая ошибка (EBADF, EIO и т.д.)
+		    	PX4_ERR("UART write error: %d", errno);
+		    	return -1;
+		}
+	    }
+	}
+	return (ssize_t)total_written;
 }
 
-void PGA460::read_data(size_t bytes_needed) {
-    uint8_t temp_buf[10];
-    int n = read(_uart_fd, temp_buf, sizeof(temp_buf));
+ssize_t PGA460::read_data(size_t bytes_needed) {
+	if (_uart_fd < 0) return -1;
+	size_t remaining = bytes_needed - _bytes_received;
 
-    if (n > 0) {
-        for (int i = 0; i < n && _bytes_received < sizeof(_read_buffer); i++) {
-            _read_buffer[_bytes_received++] = temp_buf[i];
-        }
-    }
-    if (_bytes_received >= bytes_needed) {
-        _state = State::PUBLISH_DATA;
-	ScheduleDelayed(10_ms);
-    } else {
-        if (hrt_elapsed_time(&_last_state_change) > 100_ms) {
-            _current_errors |= pga_data_s::ERR_COMM_FAILURE;
-            _state = State::PUBLISH_DATA;
+	int n = read(_uart_fd, _read_buffer + _bytes_received, remaining);
+
+	if (n > 0) {
+	    _bytes_received += n;
+
+	} else if (n < 0) {
+	    if (errno == EAGAIN || errno == EINTR) {
+		// Данных пока нет — это нормально, проверим таймаут ниже
+
+	    } else {
+		// Настоящая ошибка порта
+		PX4_ERR("UART read error: %d", errno);
+		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
+		_state = State::PUBLISH_DATA;
+		ScheduleDelayed(10_ms);
+		return -1;
+	    }
+	}
+
+	// Набрали нужное количество байт
+	if (_bytes_received >= bytes_needed) {
+	    _state = State::PUBLISH_DATA;
 	    ScheduleDelayed(10_ms);
-	    return;
-        }
-        ScheduleDelayed(1_ms);
-    }
+	    return (ssize_t)_bytes_received;
+	}
+
+	// Таймаут — данные так и не пришли
+	if (hrt_elapsed_time(&_last_state_change) > 100_ms) {
+	    PX4_WARN("read timeout: got %zu of %zu bytes", _bytes_received, bytes_needed);
+	    _current_errors |= pga_data_s::ERR_COMM_FAILURE;
+	    _state = State::PUBLISH_DATA;
+	    ScheduleDelayed(10_ms);
+	    return (ssize_t)_bytes_received;
+	}
+
+	// Ещё не всё пришло — перепланировать через 1мс
+	ScheduleDelayed(1_ms);
+	return (ssize_t)_bytes_received;
 }
 
 void PGA460::Run() {
@@ -163,7 +235,7 @@ void PGA460::Run() {
 			send_burst_and_listen();
 			_state = State::WAIT_FOR_ECHO;
 			_last_state_change = hrt_absolute_time();
-			ScheduleDelayed(30_ms);
+			ScheduleDelayed(70_ms);
 			break;
 
 		case State::WAIT_FOR_ECHO:
@@ -249,7 +321,9 @@ float PGA460::distance_processing(uint8_t *response, size_t len) {
 	}
 
 	uint16_t tof = (response[1] << 8) | response[2];
-	return (331.0f * tof * 0.00000001f) / 2.0f;
+	float distance = (331.0f * tof * 1e-6f) / 2.0f;
+	float burst_offset = 331.0f * 8 / 40000.0f / 2.0f;
+	return distance + burst_offset;
 }
 
 void PGA460::uorb_publisher(float distance_raw) {
@@ -270,7 +344,44 @@ void PGA460::uorb_publisher(float distance_raw) {
 	_current_errors = 0;
 }
 
+bool PGA460::write_register(uint8_t reg, uint8_t value) {
+	uint8_t body[3];
+	body[0] = 0x10;
+	body[1] = reg;
+	body[2] = value;
+
+	uint8_t checksum = calculate_checksum(body, 3);
+	uint8_t packet[5] = {0x55, body[0], body[1], body[2], checksum};
+
+	if (write_data(packet, sizeof(packet)) != (ssize_t)sizeof(packet)) {
+	    PX4_ERR("write_register failed: reg=0x%02X val=0x%02X", reg, value);
+	    return false; // ← теперь вызывающий знает об ошибке
+	}
+
+	return true;
+    }
+
+bool PGA460::init_hw() {
+	for (size_t i = 0; i < sizeof(pga460_config) / sizeof(pga460_config[0]); i++) {
+	    if (!write_register(pga460_config[i].addr, pga460_config[i].value)) {
+		PX4_ERR("init_hw failed at step %zu (reg=0x%02X)",
+			 i, pga460_config[i].addr);
+		return false; // ← прерываем инициализацию
+	    }
+	    usleep(2000);
+	}
+
+	PX4_INFO("PGA460 hardware initialized successfully");
+	return true;
+    }
+
+ModuleBase::Descriptor PGA460::pga460_descriptor {
+    &PGA460::task_spawn,
+    &PGA460::custom_command,
+    &PGA460::print_usage
+};
+
 int pga460_main(int argc, char *argv[]) {
-    return ModuleBase::main(pga460_descriptor, argc, argv);
+    return ModuleBase::main(PGA460::pga460_descriptor, argc, argv);
 }
 
