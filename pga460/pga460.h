@@ -20,7 +20,8 @@ enum class State {
     SEND_BURST,
     WAIT_FOR_ECHO,
     READ_DATA,
-    PUBLISH_DATA
+    PUBLISH_DATA,
+    TEMP_PROC
 };
 
 class PGA460 : public ModuleBase, public px4::ScheduledWorkItem {
@@ -38,8 +39,13 @@ public:
 private:
 	bool _initialized{false};
 	State _state{State::SEND_BURST};
+	State _next_state{State::SEND_BURST};
 	int _uart_fd{-1};
 	char _device[20]{};
+
+	float _temperature{10.0f};
+	bool _temperature_valid{false};
+	hrt_abstime _last_temp_meas{0};
 
 	orb_advert_t _topic_handle = nullptr;
 
@@ -62,7 +68,9 @@ private:
 
 	void send_burst_and_listen();
 	void request_distance();
+	void request_temperature();
 	float distance_processing(uint8_t *response, size_t len);
+	float temperature_processing(uint8_t *response, size_t len);
 	void uorb_publisher(float distance_raw);
 
 	bool write_register(uint8_t reg, uint8_t value);

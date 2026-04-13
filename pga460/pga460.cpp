@@ -1,4 +1,5 @@
 #include "pga460.h"
+#include <math.h>
 
 using namespace time_literals;
 
@@ -120,7 +121,7 @@ int PGA460::open_uart(const char *device) {
 	if (tcgetattr(_uart_fd, &uart_config) != 0) {
 		PX4_ERR("tcgetattr failed for %s: %d", device, errno);
 		close(_uart_fd);
-		uart_fd = -1;
+		_uart_fd = -1;
 		return -1;
 	}
 
@@ -143,7 +144,7 @@ int PGA460::open_uart(const char *device) {
 	if (tcsetattr(_uart_fd, TCSANOW, &uart_config) != 0) {
 		PX4_ERR("tcsetattr failed for %s: %d", device, errno);
 		close(_uart_fd);
-		uart_fd = -1;
+		_uart_fd = -1;
 		return -1;
 	}
 	return _uart_fd;
@@ -194,19 +195,19 @@ ssize_t PGA460::read_data(size_t bytes_needed) {
 	    if (errno == EAGAIN || errno == EINTR) {
 		// Данных пока нет — это нормально, проверим таймаут ниже
 
-	    } else {
-		// Настоящая ошибка порта
-		PX4_ERR("UART read error: %d", errno);
-		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
-		_state = State::PUBLISH_DATA;
-		ScheduleDelayed(10_ms);
-		return -1;
-	    }
-	}
+		} else {
+			// Настоящая ошибка порта
+			PX4_ERR("UART read error: %d", errno);
+			_current_errors |= pga_data_s::ERR_COMM_FAILURE;
+			_state = _next_state;
+			ScheduleDelayed(10_ms);
+			return -1;
+		    }
+		}
 
 	// Набрали нужное количество байт
 	if (_bytes_received >= bytes_needed) {
-	    _state = State::PUBLISH_DATA;
+	    _state = _next_state;
 	    ScheduleDelayed(10_ms);
 	    return (ssize_t)_bytes_received;
 	}
@@ -215,7 +216,7 @@ ssize_t PGA460::read_data(size_t bytes_needed) {
 	if (hrt_elapsed_time(&_last_state_change) > 100_ms) {
 	    PX4_WARN("read timeout: got %zu of %zu bytes", _bytes_received, bytes_needed);
 	    _current_errors |= pga_data_s::ERR_COMM_FAILURE;
-	    _state = State::PUBLISH_DATA;
+	    _state = _next_state;
 	    ScheduleDelayed(10_ms);
 	    return (ssize_t)_bytes_received;
 	}
@@ -231,32 +232,77 @@ void PGA460::Run() {
 		return;
 	}
 	switch (_state) {
-		case State::SEND_BURST:
+		case State::SEND_BURST: {
+
+			if (!_temperature_valid || (hrt_elapsed_time(&_last_temp_meas) >= 10_s)) {
+				request_temperature();
+				_bytes_received = 0;
+				_state = State::READ_DATA;
+				_next_state = State::TEMP_PROC;
+				_last_state_change = hrt_absolute_time();
+				ScheduleDelayed(1_ms);
+				break;
+			}
+
 			send_burst_and_listen();
 			_state = State::WAIT_FOR_ECHO;
-			_last_state_change = hrt_absolute_time();
 			ScheduleDelayed(70_ms);
 			break;
+		}
 
 		case State::WAIT_FOR_ECHO:
 			request_distance();
 			_bytes_received = 0;
 			_state = State::READ_DATA;
+			_next_state = State::PUBLISH_DATA;
 			_last_state_change = hrt_absolute_time();
 			ScheduleDelayed(2_ms);
 			break;
 
 		case State::READ_DATA:
-			read_data(6);
+			switch (_next_state) {
+				case State::PUBLISH_DATA:
+					read_data(6);
+					break;
+				case State::TEMP_PROC:
+					read_data(4);
+					break;
+				default:
+					break;
+			}
 			break;
 
-		case State::PUBLISH_DATA:
-			float distance = distance_processing(_read_buffer, _bytes_received);
+		case State::PUBLISH_DATA: {
+			const float distance = distance_processing(_read_buffer, _bytes_received);
 			uorb_publisher(distance);
 			_state = State::SEND_BURST;
 			_bytes_received = 0;
 			ScheduleDelayed(50_ms);
+			break;
+		}
 
+		case State::TEMP_PROC: {
+			const float res = temperature_processing(_read_buffer, _bytes_received);
+
+			if (isfinite(res)) {
+				_temperature = res;
+				_temperature_valid = true;
+				_last_temp_meas = hrt_absolute_time();
+			} else if (_temperature_valid) {
+				_last_temp_meas = hrt_absolute_time();
+			}
+
+			_bytes_received = 0;
+			_state = State::SEND_BURST;
+
+			if (!_temperature_valid) {
+				ScheduleDelayed(50_ms);
+			} else {
+				ScheduleDelayed(1_ms);
+			}
+
+			break;
+		}
 	}
 }
 
@@ -293,17 +339,28 @@ void PGA460::request_distance() {
 	}
 }
 
+void PGA460::request_temperature() {
+    	uint8_t body[1] = {0x04};
+    	uint8_t checksum = calculate_checksum(body, 1);
+
+    	uint8_t packet[3] = {0x55, body[0], checksum};
+
+    	if (write_data(packet, sizeof(packet)) != sizeof(packet)) {
+		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
+	}
+}
+
 float PGA460::distance_processing(uint8_t *response, size_t len) {
 	if (len != 6) {
 		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
 		tcflush(_uart_fd, TCIFLUSH);
-		return -1.0f;
+		return NAN;
 	}
 
-	uint8_t calc_cs = calculate_checksum(response, 5);
+	uint8_t calc_cs = calculate_checksum(&response[1], 4);
 	if (calc_cs != response[5]) {
 		_current_errors |= pga_data_s::ERR_UART_INVALID_SLAVE_CHECKSUM;
-		return -1.0f;
+		return NAN;
 	}
 
 	uint8_t diag_data = response[0];
@@ -317,13 +374,45 @@ float PGA460::distance_processing(uint8_t *response, size_t len) {
 		}
 		if (diag_data & (1 << 4)) _current_errors |= pga_data_s::ERR_UART_UNKNOWN_COMMAND;
 		if (diag_data & (1 << 5)) _current_errors |= pga_data_s::ERR_UART_FRAMING_FAILURE;
-		return -1.0f;
+		return NAN;
 	}
 
 	uint16_t tof = (response[1] << 8) | response[2];
-	float distance = (331.0f * tof * 1e-6f) / 2.0f;
-	float burst_offset = 331.0f * 8 / 40000.0f / 2.0f;
+	float v_sound = 331.0f + 0.6f * _temperature;
+	float distance = (v_sound * tof * 1e-6f) / 2.0f;
+	float burst_offset = v_sound * 8 / 40000.0f / 2.0f;
 	return distance + burst_offset;
+}
+
+float PGA460::temperature_processing(uint8_t *response, size_t len) {
+	if (len != 4) {
+		_current_errors |= pga_data_s::ERR_COMM_FAILURE;
+		tcflush(_uart_fd, TCIFLUSH);
+		return NAN;
+	}
+
+	uint8_t calc_cs = calculate_checksum(&response[1], 2);
+	if (calc_cs != response[3]) {
+		_current_errors |= pga_data_s::ERR_UART_INVALID_SLAVE_CHECKSUM;
+		return NAN;
+	}
+
+	uint8_t diag_data = response[0];
+
+	if (diag_data & 0x3E) {
+		if (diag_data & (1 << 1)) _current_errors |= pga_data_s::ERR_UART_BAUD_RATE_MISMATCH;
+		if (diag_data & (1 << 2)) _current_errors |= pga_data_s::ERR_UART_SYNC_STABILITY;
+		if (diag_data & (1 << 3)) {
+			_current_errors |= pga_data_s::ERR_UART_INVALID_MASTER_CHECKSUM;
+			tcflush(_uart_fd, TCOFLUSH);
+		}
+		if (diag_data & (1 << 4)) _current_errors |= pga_data_s::ERR_UART_UNKNOWN_COMMAND;
+		if (diag_data & (1 << 5)) _current_errors |= pga_data_s::ERR_UART_FRAMING_FAILURE;
+		return NAN;
+	}
+
+	float temp = (response[1] - 64) / 1.5;
+	return temp;
 }
 
 void PGA460::uorb_publisher(float distance_raw) {
@@ -355,7 +444,7 @@ bool PGA460::write_register(uint8_t reg, uint8_t value) {
 
 	if (write_data(packet, sizeof(packet)) != (ssize_t)sizeof(packet)) {
 	    PX4_ERR("write_register failed: reg=0x%02X val=0x%02X", reg, value);
-	    return false; // ← теперь вызывающий знает об ошибке
+	    return false;
 	}
 
 	return true;
@@ -366,7 +455,7 @@ bool PGA460::init_hw() {
 	    if (!write_register(pga460_config[i].addr, pga460_config[i].value)) {
 		PX4_ERR("init_hw failed at step %zu (reg=0x%02X)",
 			 i, pga460_config[i].addr);
-		return false; // ← прерываем инициализацию
+		return false;
 	    }
 	    usleep(2000);
 	}
