@@ -25,7 +25,6 @@ static const pga460_config_t pga460_config[] = {
     {0x46, 0x66}, {0x47, 0x55}, {0x48, 0x44}, // 2 m+     (low)
 };
 
-// ─── Module boilerplate ────────────────────────────────────────────────────────
 
 PGA460::PGA460(const char *device) :
     ModuleBase(),
@@ -93,8 +92,6 @@ int PGA460::print_usage(const char *reason)
     return 0;
 }
 
-// ─── State machine ─────────────────────────────────────────────────────────────
-
 void PGA460::Run()
 {
     if (should_exit()) {
@@ -106,9 +103,9 @@ void PGA460::Run()
 
     case State::SEND_BURST:
         if (!_temperature_valid || hrt_elapsed_time(&_last_temp_meas) >= 10_s) {
-            cmd_temp_req();   // → WRITING → READING → PROC_TEMP
+            cmd_temp_req();
         } else {
-            cmd_burst();      // → WRITING → WAIT_ECHO
+            cmd_burst();
         }
         break;
 
@@ -122,7 +119,7 @@ void PGA460::Run()
         break;
 
     case State::WAIT_ECHO:
-        cmd_dist_req();       // → WRITING → READING → PROC_DIST
+        cmd_dist_req();
         break;
 
     case State::READING:
@@ -156,8 +153,6 @@ void PGA460::Run()
     }
 }
 
-// ─── Non-blocking TX ──────────────────────────────────────────────────────────
-
 void PGA460::start_write(const uint8_t *data, size_t len, State after, hrt_abstime delay)
 {
     memcpy(_tx_buf, data, len);
@@ -185,8 +180,6 @@ bool PGA460::tx_flush()
     }
     return true;
 }
-
-// ─── Non-blocking RX ──────────────────────────────────────────────────────────
 
 void PGA460::start_read(size_t bytes, State after)
 {
@@ -218,8 +211,6 @@ bool PGA460::rx_collect()
     }
     return true;
 }
-
-// ─── Protocol ─────────────────────────────────────────────────────────────────
 
 uint8_t PGA460::calculate_checksum(const uint8_t *data, size_t len)
 {
@@ -278,7 +269,7 @@ float PGA460::parse_distance()
     uint16_t tof     = ((uint16_t)_rx_buf[1] << 8) | _rx_buf[2];
     float    v_sound = 331.0f + 0.6f * _temperature;
     float    dist    = (v_sound * tof * 1e-6f) / 2.0f;
-    float    offset  = v_sound * 8.0f / 40000.0f / 2.0f;  // burst-length correction
+    float    offset  = v_sound * 8.0f / 40000.0f / 2.0f;
     return dist + offset;
 }
 
@@ -314,8 +305,6 @@ void PGA460::publish(float distance)
     }
 }
 
-// ─── UART ─────────────────────────────────────────────────────────────────────
-
 int PGA460::open_uart(const char *device)
 {
     _uart_fd = open(device, O_RDWR | O_NOCTTY | O_NONBLOCK);
@@ -348,8 +337,6 @@ void PGA460::close_uart()
     if (_uart_fd >= 0) { close(_uart_fd); _uart_fd = -1; }
 }
 
-// ─── Hardware init (blocking — runs before work queue starts) ─────────────────
-
 bool PGA460::write_register(uint8_t reg, uint8_t value)
 {
     uint8_t body[3]   = {0x10, reg, value};
@@ -377,8 +364,6 @@ bool PGA460::init_hw()
     PX4_INFO("PGA460 initialized");
     return true;
 }
-
-// ─── Entry point ──────────────────────────────────────────────────────────────
 
 ModuleBase::Descriptor PGA460::pga460_descriptor {
     &PGA460::task_spawn,

@@ -16,23 +16,13 @@
 #include <termios.h>
 #include <errno.h>
 
-// ─── State machine ─────────────────────────────────────────────────────────────
-//
-//  SEND_BURST ──(need temp)──► WRITING ──► READING ──► PROC_TEMP
-//      ▲                                                    │
-//      └────────────────────────────────────────────────────┘
-//      │
-//      └──(temp ok)──► WRITING ──► WAIT_ECHO ──► WRITING ──► READING ──► PROC_DIST
-//                                                                              │
-//                                                                              └──►
-//
 enum class State : uint8_t {
-    SEND_BURST,   // decide what to send next
-    WRITING,      // flush TX buffer, non-blocking
-    WAIT_ECHO,    // 70 ms echo window after burst+listen
-    READING,      // accumulate RX buffer, non-blocking
-    PROC_TEMP,    // parse temperature response, update cache
-    PROC_DIST,    // parse distance response, publish
+    SEND_BURST,
+    WRITING,
+    WAIT_ECHO,
+    READING,
+    PROC_TEMP,
+    PROC_DIST,
 };
 
 struct pga460_config_t {
@@ -53,53 +43,42 @@ public:
     static ModuleBase::Descriptor pga460_descriptor;
 
 private:
-    // ── UART ──────────────────────────────────────────────────────────────────
     int  _uart_fd{-1};
     char _device[20]{};
 
-    // ── Non-blocking TX ───────────────────────────────────────────────────────
     uint8_t     _tx_buf[8]{};
     size_t      _tx_len{0};
     size_t      _tx_offset{0};
     State       _after_write{State::WAIT_ECHO};
     hrt_abstime _after_write_delay{0};
 
-    // ── Non-blocking RX ───────────────────────────────────────────────────────
     uint8_t     _rx_buf[10]{};
     size_t      _rx_received{0};
     size_t      _rx_needed{0};
     State       _after_read{State::PROC_TEMP};
     hrt_abstime _rx_start_time{0};
 
-    // ── State machine ─────────────────────────────────────────────────────────
     State _state{State::SEND_BURST};
 
-    // ── Sensor state ──────────────────────────────────────────────────────────
     float       _temperature{10.0f};
     bool        _temperature_valid{false};
     hrt_abstime _last_temp_meas{0};
     uint8_t     _current_errors{0};
 
-    // ── uORB ──────────────────────────────────────────────────────────────────
     orb_advert_t _topic_handle{nullptr};
 
-    // ── Work queue ────────────────────────────────────────────────────────────
     void Run() override;
     void request_stop() override;
 
-    // ── UART ──────────────────────────────────────────────────────────────────
     int  open_uart(const char *device);
     void close_uart();
 
-    // ── Non-blocking TX ───────────────────────────────────────────────────────
     void start_write(const uint8_t *data, size_t len, State after, hrt_abstime delay);
-    bool tx_flush();     // true = done, false = EAGAIN (retry later)
+    bool tx_flush();
 
-    // ── Non-blocking RX ───────────────────────────────────────────────────────
     void start_read(size_t bytes, State after);
-    bool rx_collect();   // true = done, false = not enough data yet
+    bool rx_collect();
 
-    // ── Protocol ──────────────────────────────────────────────────────────────
     uint8_t calculate_checksum(const uint8_t *data, size_t len);
     bool    parse_diag_byte(uint8_t diag);
     void    cmd_burst();
@@ -109,7 +88,6 @@ private:
     float   parse_temperature();
     void    publish(float distance);
 
-    // ── Hardware init (blocking, runs before work queue) ──────────────────────
     bool write_register(uint8_t reg, uint8_t value);
     bool init_hw();
 };
