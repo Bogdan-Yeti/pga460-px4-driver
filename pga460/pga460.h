@@ -16,6 +16,25 @@
 #include <termios.h>
 #include <errno.h>
 
+#define PGA460_SYNC_BYTE          0x55U
+
+#define PGA460_CMD_TEMP_REQ       0x04U
+#define PGA460_CMD_DIST_REQ       0x05U
+#define PGA460_CMD_BURST          0x00U
+#define PGA460_CMD_WRITE_REG      0x10U
+
+#define PGA460_COUNT_OBJECT       0x01U
+
+#define PGA460_TEMP_RESP_LEN      4U
+#define PGA460_DIST_RESP_LEN      6U
+
+#define PGA460_DIAG_ERROR_MASK    0x3EU
+#define PGA460_DIAG_BAUD_ERR      (1U << 1)
+#define PGA460_DIAG_SYNC_ERR      (1U << 2)
+#define PGA460_DIAG_CHECKSUM_ERR  (1U << 3)
+#define PGA460_DIAG_UNKNOWN_CMD   (1U << 4)
+#define PGA460_DIAG_FRAMING_ERR   (1U << 5)
+
 enum class State : uint8_t {
     SEND_BURST,
     WRITING,
@@ -81,6 +100,7 @@ private:
 
     uint8_t calculate_checksum(const uint8_t *data, size_t len);
     bool    parse_diag_byte(uint8_t diag);
+    bool    validate_response(size_t expected_len);
     void    cmd_burst();
     void    cmd_dist_req();
     void    cmd_temp_req();

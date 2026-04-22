@@ -207,50 +207,55 @@ uint8_t PGA460::calculate_checksum(const uint8_t *data, size_t len)
 
 bool PGA460::parse_diag_byte(uint8_t diag)
 {
-    if (!(diag & 0x3E)) return true;
-    if (diag & (1 << 1)) _current_errors |= pga_data_s::ERR_UART_BAUD_RATE_MISMATCH;
-    if (diag & (1 << 2)) _current_errors |= pga_data_s::ERR_UART_SYNC_STABILITY;
-    if (diag & (1 << 3)) { _current_errors |= pga_data_s::ERR_UART_INVALID_MASTER_CHECKSUM; tcflush(_uart_fd, TCOFLUSH); }
-    if (diag & (1 << 4)) _current_errors |= pga_data_s::ERR_UART_UNKNOWN_COMMAND;
-    if (diag & (1 << 5)) _current_errors |= pga_data_s::ERR_UART_FRAMING_FAILURE;
+    if (!(diag & PGA460_DIAG_ERROR_MASK)) return true;
+    if (diag & PGA460_DIAG_BAUD_ERR)     _current_errors |= pga_data_s::ERR_UART_BAUD_RATE_MISMATCH;
+    if (diag & PGA460_DIAG_SYNC_ERR)     _current_errors |= pga_data_s::ERR_UART_SYNC_STABILITY;
+    if (diag & PGA460_DIAG_CHECKSUM_ERR) { _current_errors |= pga_data_s::ERR_UART_INVALID_MASTER_CHECKSUM; tcflush(_uart_fd, TCOFLUSH); }
+    if (diag & PGA460_DIAG_UNKNOWN_CMD)  _current_errors |= pga_data_s::ERR_UART_UNKNOWN_COMMAND;
+    if (diag & PGA460_DIAG_FRAMING_ERR)  _current_errors |= pga_data_s::ERR_UART_FRAMING_FAILURE;
     return false;
 }
 
 void PGA460::cmd_burst()
 {
-    uint8_t body[2]   = {0x00, 0x01};
-    uint8_t packet[4] = {0x55, body[0], body[1], calculate_checksum(body, 2)};
+    uint8_t body[2]   = {PGA460_CMD_BURST, PGA460_COUNT_OBJECT};
+    uint8_t packet[4] = {PGA460_SYNC_BYTE, body[0], body[1], calculate_checksum(body, 2)};
     start_write(packet, sizeof(packet), State::WAIT_ECHO, 70_ms);
 }
 
 void PGA460::cmd_dist_req()
 {
-    uint8_t body[1]   = {0x05};
-    uint8_t packet[3] = {0x55, body[0], calculate_checksum(body, 1)};
-    start_read(6, State::PROC_DIST);
+    uint8_t body[1]   = {PGA460_CMD_DIST_REQ};
+    uint8_t packet[3] = {PGA460_SYNC_BYTE, body[0], calculate_checksum(body, 1)};
+    start_read(PGA460_DIST_RESP_LEN, State::PROC_DIST);
     start_write(packet, sizeof(packet), State::READING, 2_ms);
 }
 
 void PGA460::cmd_temp_req()
 {
-    uint8_t body[1]   = {0x04};
-    uint8_t packet[3] = {0x55, body[0], calculate_checksum(body, 1)};
-    start_read(4, State::PROC_TEMP);
+    uint8_t body[1]   = {PGA460_CMD_TEMP_REQ};
+    uint8_t packet[3] = {PGA460_SYNC_BYTE, body[0], calculate_checksum(body, 1)};
+    start_read(PGA460_TEMP_RESP_LEN, State::PROC_TEMP);
     start_write(packet, sizeof(packet), State::READING, 1_ms);
+}
+
+bool PGA460::validate_response(size_t expected_len)
+{
+    if (_rx_received != expected_len) {
+        _current_errors |= pga_data_s::ERR_COMM_FAILURE;
+        tcflush(_uart_fd, TCIFLUSH);
+        return false;
+    }
+    if (calculate_checksum(&_rx_buf[1], expected_len - 2) != _rx_buf[expected_len - 1]) {
+        _current_errors |= pga_data_s::ERR_UART_INVALID_SLAVE_CHECKSUM;
+        return false;
+    }
+    return parse_diag_byte(_rx_buf[0]);
 }
 
 float PGA460::parse_distance()
 {
-    if (_rx_received != 6) {
-        _current_errors |= pga_data_s::ERR_COMM_FAILURE;
-        tcflush(_uart_fd, TCIFLUSH);
-        return NAN;
-    }
-    if (calculate_checksum(&_rx_buf[1], 4) != _rx_buf[5]) {
-        _current_errors |= pga_data_s::ERR_UART_INVALID_SLAVE_CHECKSUM;
-        return NAN;
-    }
-    if (!parse_diag_byte(_rx_buf[0])) return NAN;
+    if (!validate_response(PGA460_DIST_RESP_LEN)) return NAN;
 
     uint16_t tof     = ((uint16_t)_rx_buf[1] << 8) | _rx_buf[2];
     float    v_sound = 331.0f + 0.6f * _temperature;
@@ -261,17 +266,7 @@ float PGA460::parse_distance()
 
 float PGA460::parse_temperature()
 {
-    if (_rx_received != 4) {
-        _current_errors |= pga_data_s::ERR_COMM_FAILURE;
-        tcflush(_uart_fd, TCIFLUSH);
-        return NAN;
-    }
-    if (calculate_checksum(&_rx_buf[1], 2) != _rx_buf[3]) {
-        _current_errors |= pga_data_s::ERR_UART_INVALID_SLAVE_CHECKSUM;
-        return NAN;
-    }
-    if (!parse_diag_byte(_rx_buf[0])) return NAN;
-
+    if (!validate_response(PGA460_TEMP_RESP_LEN)) return NAN;
     return (_rx_buf[1] - 64) / 1.5f;
 }
 
@@ -304,14 +299,14 @@ int PGA460::open_uart(const char *device)
         close(_uart_fd); _uart_fd = -1; return -1;
     }
 
-    cfg.c_cflag |= (CLOCAL | CREAD);
-    cfg.c_cflag  = (cfg.c_cflag & ~CSIZE) | CS8;
-    cfg.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS);
-    cfg.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-    cfg.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-    cfg.c_oflag &= ~OPOST;
-    cfsetispeed(&cfg, B115200);
-    cfsetospeed(&cfg, B115200);
+    cfg.c_cflag |= (CLOCAL | CREAD);       // ignore modem control lines, enable receiver
+    cfg.c_cflag  = (cfg.c_cflag & ~CSIZE) | CS8; // 8 data bits
+    cfg.c_cflag &= ~(PARENB | CSTOPB | CRTSCTS); // no parity, 1 stop bit, no hardware flow control
+    cfg.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN); // raw mode: no echo, no canonical processing, no signals
+    cfg.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON); // disable all input processing
+    cfg.c_oflag &= ~OPOST;                 // disable output processing
+    cfsetispeed(&cfg, B115200);            // input baud rate 115200
+    cfsetospeed(&cfg, B115200);            // output baud rate 115200
 
     if (tcsetattr(_uart_fd, TCSANOW, &cfg) != 0) {
         PX4_ERR("tcsetattr failed: %d", errno);
@@ -327,8 +322,8 @@ void PGA460::close_uart()
 
 bool PGA460::write_register(uint8_t reg, uint8_t value)
 {
-    uint8_t body[3]   = {0x10, reg, value};
-    uint8_t packet[5] = {0x55, body[0], body[1], body[2], calculate_checksum(body, 3)};
+    uint8_t body[3]   = {PGA460_CMD_WRITE_REG, reg, value};
+    uint8_t packet[5] = {PGA460_SYNC_BYTE, body[0], body[1], body[2], calculate_checksum(body, 3)};
 
     size_t offset = 0;
     while (offset < sizeof(packet)) {
@@ -342,9 +337,9 @@ bool PGA460::write_register(uint8_t reg, uint8_t value)
 
 bool PGA460::init_hw()
 {
-    for (size_t i = 0; i < sizeof(pga460_config) / sizeof(*pga460_config); i++) {
-        if (!write_register(pga460_config[i].addr, pga460_config[i].value)) {
-            PX4_ERR("init_hw failed at step %zu (reg=0x%02X)", i, pga460_config[i].addr);
+    for (const auto &cfg : pga460_config) {
+        if (!write_register(cfg.addr, cfg.value)) {
+            PX4_ERR("init_hw failed (reg=0x%02X)", cfg.addr);
             return false;
         }
         usleep(2000);
