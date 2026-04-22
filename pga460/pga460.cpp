@@ -6,23 +6,9 @@ using namespace time_literals;
 extern "C" __EXPORT int pga460_main(int argc, char *argv[]);
 
 static const pga460_config_t pga460_config[] = {
-    // Frequency & pulse
-    {0x14, 0x32}, // FREQ: 40 kHz
-    {0x15, 0x08}, // P1_PULSE_COUNT: 8 pulses
-    {0x10, 0x40}, // CURR_LIM_P1
-    {0x1B, 0x0F}, // DECPL_TIME: reduces blind zone
-
-    // Time Varied Gain
-    {0x1D, 0x11}, // TVG_RANGE
-    {0x1E, 0x88}, // TVG_GAIN_0
-    {0x1F, 0xAA}, // TVG_GAIN_1
-    {0x20, 0xCC}, // TVG_GAIN_2
-    {0x21, 0xFF}, // TVG_GAIN_3
-
-    // Thresholds for preset P1
-    {0x40, 0xEE}, {0x41, 0xEE}, {0x42, 0xDD}, // 0–50 cm  (high)
-    {0x43, 0xBB}, {0x44, 0x88}, {0x45, 0x77}, // 50 cm–2 m
-    {0x46, 0x66}, {0x47, 0x55}, {0x48, 0x44}, // 2 m+     (low)
+    {0x1C, 0x32}, // FREQ: 40 kHz
+    {0x1E, 0x08}, // P1_PULSE_COUNT: 8 pulses
+    {0x26, 0x00}, // DECPL_TIME: reduces blind zone
 };
 
 
@@ -295,6 +281,8 @@ void PGA460::publish(float distance)
     msg.timestamp    = hrt_absolute_time();
     msg.distance_m   = distance;
     msg.max_distance = 11.0f;
+    float v_sound = 331.0f + 0.6f * _temperature;
+    msg.min_distance = v_sound * 0.004096f / 2.0f;
     msg.status_flags = _current_errors;
     _current_errors  = 0;
 

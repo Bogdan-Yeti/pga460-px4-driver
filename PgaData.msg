@@ -2,6 +2,7 @@ uint64 timestamp          # Время с момента запуска сист
 
 float32 distance_m        # Дистанция в метрах
 float32 max_distance      # Максимальная дистанция по паспорту
+float32 min_distance      # Рассчитывается исходя из DECPL_TIME
 
 # Битовая маска ошибок (0 = OK)
 uint8 status_flags
@@ -14,4 +15,5 @@ uint8 ERR_UART_INVALID_MASTER_CHECKSUM = 8 # Ошибка отправленно
 uint8 ERR_UART_UNKNOWN_COMMAND = 16 # Ошибка команды
 uint8 ERR_UART_FRAMING_FAILURE = 32 # Общая ошибка кадра
 uint8 ERR_UART_INVALID_SLAVE_CHECKSUM = 64 # Ошибка контрольной суммы от устройства
+
 
