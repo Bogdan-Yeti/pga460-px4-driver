@@ -8,3 +8,10 @@ px4_add_module(
 	DEPENDS
 		px4_work_queue
 	)
+
+px4_add_functional_gtest(
+	SRC pga460_tests.cpp
+	EXTRA_SRCS pga460.cpp
+	LINKLIBS px4_work_queue
+	)
+

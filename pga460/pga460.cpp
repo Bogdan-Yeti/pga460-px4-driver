@@ -5,7 +5,7 @@ using namespace time_literals;
 
 extern "C" __EXPORT int pga460_main(int argc, char *argv[]);
 
-static const pga460_config_t pga460_config[] = {
+static const pga460_config_t k_hw_regs[] = {
     {0x1C, 0x32}, // FREQ: 40 kHz
     {0x1E, 0x08}, // P1_PULSE_COUNT: 8 pulses
     {0x26, 0x00}, // DECPL_TIME: reduces blind zone
@@ -207,35 +207,37 @@ uint8_t PGA460::calculate_checksum(const uint8_t *data, size_t len)
 
 bool PGA460::parse_diag_byte(uint8_t diag)
 {
-    if (!(diag & PGA460_DIAG_ERROR_MASK)) return true;
-    if (diag & PGA460_DIAG_BAUD_ERR)     _current_errors |= pga_data_s::ERR_UART_BAUD_RATE_MISMATCH;
-    if (diag & PGA460_DIAG_SYNC_ERR)     _current_errors |= pga_data_s::ERR_UART_SYNC_STABILITY;
-    if (diag & PGA460_DIAG_CHECKSUM_ERR) { _current_errors |= pga_data_s::ERR_UART_INVALID_MASTER_CHECKSUM; tcflush(_uart_fd, TCOFLUSH); }
-    if (diag & PGA460_DIAG_UNKNOWN_CMD)  _current_errors |= pga_data_s::ERR_UART_UNKNOWN_COMMAND;
-    if (diag & PGA460_DIAG_FRAMING_ERR)  _current_errors |= pga_data_s::ERR_UART_FRAMING_FAILURE;
+    if (!(diag & DIAG_ERROR_MASK)) return true;
+    if (diag & DIAG_BAUD_ERR)     _current_errors |= pga_data_s::ERR_UART_BAUD_RATE_MISMATCH;
+    if (diag & DIAG_SYNC_ERR)     _current_errors |= pga_data_s::ERR_UART_SYNC_STABILITY;
+    if (diag & DIAG_CHECKSUM_ERR) { _current_errors |= pga_data_s::ERR_UART_INVALID_MASTER_CHECKSUM; tcflush(_uart_fd, TCOFLUSH); }
+    if (diag & DIAG_UNKNOWN_CMD)  _current_errors |= pga_data_s::ERR_UART_UNKNOWN_COMMAND;
+    if (diag & DIAG_FRAMING_ERR)  _current_errors |= pga_data_s::ERR_UART_FRAMING_FAILURE;
     return false;
 }
 
 void PGA460::cmd_burst()
 {
-    uint8_t body[2]   = {PGA460_CMD_BURST, PGA460_COUNT_OBJECT};
-    uint8_t packet[4] = {PGA460_SYNC_BYTE, body[0], body[1], calculate_checksum(body, 2)};
+    uint8_t body[2]   = {CMD_BURST, ONE_OBJECT};
+    uint8_t packet[4] = {SYNC_BYTE, body[0], body[1], calculate_checksum(body, 2)};
     start_write(packet, sizeof(packet), State::WAIT_ECHO, 70_ms);
 }
 
 void PGA460::cmd_dist_req()
 {
-    uint8_t body[1]   = {PGA460_CMD_DIST_REQ};
-    uint8_t packet[3] = {PGA460_SYNC_BYTE, body[0], calculate_checksum(body, 1)};
-    start_read(PGA460_DIST_RESP_LEN, State::PROC_DIST);
+    uint8_t body[1]   = {CMD_DIST_REQ};
+    uint8_t packet[3] = {SYNC_BYTE, body[0], calculate_checksum(body, 1)};
+    // start_read first: params must be set before WRITING→READING transition
+    start_read(DIST_RESP_LEN, State::PROC_DIST);
     start_write(packet, sizeof(packet), State::READING, 2_ms);
 }
 
 void PGA460::cmd_temp_req()
 {
-    uint8_t body[1]   = {PGA460_CMD_TEMP_REQ};
-    uint8_t packet[3] = {PGA460_SYNC_BYTE, body[0], calculate_checksum(body, 1)};
-    start_read(PGA460_TEMP_RESP_LEN, State::PROC_TEMP);
+    uint8_t body[1]   = {CMD_TEMP_REQ};
+    uint8_t packet[3] = {SYNC_BYTE, body[0], calculate_checksum(body, 1)};
+    // start_read first: params must be set before WRITING→READING transition
+    start_read(TEMP_RESP_LEN, State::PROC_TEMP);
     start_write(packet, sizeof(packet), State::READING, 1_ms);
 }
 
@@ -255,7 +257,7 @@ bool PGA460::validate_response(size_t expected_len)
 
 float PGA460::parse_distance()
 {
-    if (!validate_response(PGA460_DIST_RESP_LEN)) return NAN;
+    if (!validate_response(DIST_RESP_LEN)) return NAN;
 
     uint16_t tof     = ((uint16_t)_rx_buf[1] << 8) | _rx_buf[2];
     float    v_sound = 331.0f + 0.6f * _temperature;
@@ -266,8 +268,8 @@ float PGA460::parse_distance()
 
 float PGA460::parse_temperature()
 {
-    if (!validate_response(PGA460_TEMP_RESP_LEN)) return NAN;
-    return (_rx_buf[1] - 64) / 1.5f;
+    if (!validate_response(TEMP_RESP_LEN)) return NAN;
+    return (static_cast<int>(_rx_buf[1]) - 64) / 1.5f;
 }
 
 void PGA460::publish(float distance)
@@ -279,13 +281,14 @@ void PGA460::publish(float distance)
     float v_sound = 331.0f + 0.6f * _temperature;
     msg.min_distance = v_sound * 0.004096f / 2.0f;
     msg.status_flags = _current_errors;
-    _current_errors  = 0;
 
     if (_topic_handle == nullptr) {
         _topic_handle = orb_advertise(ORB_ID(pga_data), &msg);
     } else {
         orb_publish(ORB_ID(pga_data), _topic_handle, &msg);
     }
+
+    _current_errors = 0;
 }
 
 int PGA460::open_uart(const char *device)
@@ -322,8 +325,8 @@ void PGA460::close_uart()
 
 bool PGA460::write_register(uint8_t reg, uint8_t value)
 {
-    uint8_t body[3]   = {PGA460_CMD_WRITE_REG, reg, value};
-    uint8_t packet[5] = {PGA460_SYNC_BYTE, body[0], body[1], body[2], calculate_checksum(body, 3)};
+    uint8_t body[3]   = {CMD_WRITE_REG, reg, value};
+    uint8_t packet[5] = {SYNC_BYTE, body[0], body[1], body[2], calculate_checksum(body, 3)};
 
     size_t offset = 0;
     while (offset < sizeof(packet)) {
@@ -337,7 +340,7 @@ bool PGA460::write_register(uint8_t reg, uint8_t value)
 
 bool PGA460::init_hw()
 {
-    for (const auto &cfg : pga460_config) {
+    for (const auto &cfg : k_hw_regs) {
         if (!write_register(cfg.addr, cfg.value)) {
             PX4_ERR("init_hw failed (reg=0x%02X)", cfg.addr);
             return false;

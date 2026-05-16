@@ -16,24 +16,24 @@
 #include <termios.h>
 #include <errno.h>
 
-#define PGA460_SYNC_BYTE          0x55U
+#define SYNC_BYTE          0x55U
 
-#define PGA460_CMD_TEMP_REQ       0x04U
-#define PGA460_CMD_DIST_REQ       0x05U
-#define PGA460_CMD_BURST          0x00U
-#define PGA460_CMD_WRITE_REG      0x10U
+#define CMD_TEMP_REQ       0x04U
+#define CMD_DIST_REQ       0x05U
+#define CMD_BURST          0x00U
+#define CMD_WRITE_REG      0x10U
 
-#define PGA460_COUNT_OBJECT       0x01U
+#define ONE_OBJECT       0x01U
 
-#define PGA460_TEMP_RESP_LEN      4U
-#define PGA460_DIST_RESP_LEN      6U
+#define TEMP_RESP_LEN      4U
+#define DIST_RESP_LEN      6U
 
-#define PGA460_DIAG_ERROR_MASK    0x3EU
-#define PGA460_DIAG_BAUD_ERR      (1U << 1)
-#define PGA460_DIAG_SYNC_ERR      (1U << 2)
-#define PGA460_DIAG_CHECKSUM_ERR  (1U << 3)
-#define PGA460_DIAG_UNKNOWN_CMD   (1U << 4)
-#define PGA460_DIAG_FRAMING_ERR   (1U << 5)
+#define DIAG_ERROR_MASK    0x3EU
+#define DIAG_BAUD_ERR      (1U << 1)
+#define DIAG_SYNC_ERR      (1U << 2)
+#define DIAG_CHECKSUM_ERR  (1U << 3)
+#define DIAG_UNKNOWN_CMD   (1U << 4)
+#define DIAG_FRAMING_ERR   (1U << 5)
 
 enum class State : uint8_t {
     SEND_BURST,
@@ -60,18 +60,22 @@ public:
     int print_status() override;
 
     static ModuleBase::Descriptor pga460_descriptor;
+    static uint8_t calculate_checksum(const uint8_t *data, size_t len);
 
 private:
     int  _uart_fd{-1};
     char _device[20]{};
 
-    uint8_t     _tx_buf[8]{};
+    static constexpr size_t TX_BUF_SIZE = 8;   // max packet: CMD_WRITE_REG = 5 bytes
+    static constexpr size_t RX_BUF_SIZE = 10;  // max response: DIST_RESP_LEN = 6 bytes
+
+    uint8_t     _tx_buf[TX_BUF_SIZE]{};
     size_t      _tx_len{0};
     size_t      _tx_offset{0};
     State       _after_write{State::WAIT_ECHO};
     hrt_abstime _after_write_delay{0};
 
-    uint8_t     _rx_buf[10]{};
+    uint8_t     _rx_buf[RX_BUF_SIZE]{};
     size_t      _rx_received{0};
     size_t      _rx_needed{0};
     State       _after_read{State::PROC_TEMP};
@@ -80,7 +84,7 @@ private:
     State _state{State::SEND_BURST};
 
     float       _temperature{10.0f};
-    bool        _temperature_valid{false};
+    bool        _temperature_valid{false};ыы
     hrt_abstime _last_temp_meas{0};
     uint8_t     _current_errors{0};
 
@@ -98,7 +102,6 @@ private:
     void start_read(size_t bytes, State after);
     bool rx_collect();
 
-    uint8_t calculate_checksum(const uint8_t *data, size_t len);
     bool    parse_diag_byte(uint8_t diag);
     bool    validate_response(size_t expected_len);
     void    cmd_burst();
@@ -110,5 +113,7 @@ private:
 
     bool write_register(uint8_t reg, uint8_t value);
     bool init_hw();
+
+    friend class PGA460UnitTest;ы
 };
 
