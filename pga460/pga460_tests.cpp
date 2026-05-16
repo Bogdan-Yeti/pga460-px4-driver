@@ -2,9 +2,6 @@
 #include "pga460.h"
 #include <math.h>
 
-// TEST_F generates a subclass of the fixture, which is NOT a friend of PGA460.
-// All private-member access must go through protected wrapper methods here,
-// since PGA460UnitTest itself IS a friend.
 class PGA460UnitTest : public ::testing::Test {
 protected:
 	// PGA460 constructor calls open_uart; /dev/null is not a tty so
